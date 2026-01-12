@@ -1,0 +1,558 @@
+from typing import Optional, List, AsyncGenerator
+
+import json5
+from pydantic import BaseModel, ConfigDict, Field
+
+from metagpt.actions import ExecuteNbCode
+from metagpt.actions.ds_agent.conclude_res import Conclusion
+from metagpt.actions.lats.lats_react import ExecuteAction
+from metagpt.logs import logger
+from metagpt.rag.engines.customSolutionSamplesGenerate import SolutionSpaceGenerateEngine
+from metagpt.strategy.lats_react import Node, set_node_score, collect_leaf_nodes, collect_all_nodes, backpropagate, \
+    evaluate_sub_node, collect_trajectory, generate_prompt, generate_short_prompt, trajectory2plan
+from metagpt.utils.common import CodeParser
+
+
+class LanguageAgentTreeSearchStream(BaseModel):
+    # note 如果 LanguageAgentTreeSearch 类不需要 pydantic 提供的数据验证和其他功能，可以考虑不继承自 BaseModel。
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    goal: str = ""
+    root: Optional[Node] = None
+    all_nodes: List[Node] = Field(default_factory=list)
+    failed_trajectories: List = Field(default_factory=list)
+    terminal_nodes: List = Field(default_factory=list)
+    reflection_map: dict = {}
+    max_reflections_per_node: int = 3
+    solution_space_generate_engine: SolutionSpaceGenerateEngine = SolutionSpaceGenerateEngine()
+    use_exp_driven_search: bool = True
+
+    def summarize_trajectory(self, node: Node) -> tuple[list[str], list[str]]:
+        thoughts, observations = [], []
+        current_node = node
+        while current_node:
+            thoughts.append(current_node.state.get('thought', ''))
+            observations.append(current_node.state.get('observation', ''))
+            current_node = current_node.parent
+        return thoughts[::-1], observations[::-1]
+
+    async def enhance_run(self, iterations=10, n_generate_sample=2) -> AsyncGenerator[str, None]:
+        best_child = None
+        all_nodes = []
+        yield f"🚀 任务接收成功：{self.goal[:100]}...\n"
+        async for info in self.streaming_run(iterations, n_generate_sample):
+            if info["type"] == "iteration_start":
+                yield f"开始第 {info['iteration']} 次迭代\n"
+            elif info["type"] == "force_pda_done":
+                root = info["root"]
+                yield f"初始化完成，根节点分数设置为7。根节点状态：\n```json\n{root.state}\n```\n"
+            elif info["type"] == "leaf_terminal_nodes":
+                nodes = info["nodes"]
+                yield f"发现终端节点共 {len(nodes)} 个。最高奖励节点分数：{nodes[0].reward if nodes else '无'}\n"
+            elif info["type"] == "high_reward_node_found":
+                node = info["node"]
+                yield f"在迭代 {info['iteration']} 中找到高奖励终端节点，奖励分数：{node.reward}\n"
+            elif info["type"] == "node_selected":
+                node = info["node"]
+                yield f"选择节点：Node(depth={node.depth}, reward={node.reward})：`{node.state.get('thought', {}).get('thought', '')}`\n"
+            elif info["type"] == "node_expanded":
+                parent = info["parent"]
+                children = info["children"]
+                yield f"扩展节点，生成 {len(children)} 个子节点。子节点奖励分数：{[child['reward'] for child in children]}\n"
+            elif info["type"] == "rollout_result":
+                terminal_node = info["terminal_node"]
+                yield f"模拟回滚完成，终端节点奖励分数：{terminal_node.reward}\n"
+            elif info["type"] == "backpropagate":
+                yield f"回溯更新节点分值，终端节点奖励：{info['reward']}\n"
+            elif info["type"] == "action_executed":
+                yield (f"执行动作：\n```python\n{info['action']}\n```\n 观察结果：\n```\n{info['observation']}\n```\n"
+                       f"是否成功：{'是' if info['is_success'] else '否'}\n")
+            elif info["type"] == "final_best_child":
+                best_child = info["best_child"]
+                all_nodes = info["all_nodes"]
+                yield f"迭代完成，最佳节点奖励分数：{best_child.reward}\n"
+            elif info["type"] == "reflection_generated":
+                yield f"生成反思: {info['reflection']}\n"
+
+        for node in all_nodes:
+            await node.execute_code.terminate()
+
+        if best_child:
+            thoughts, observations = self.summarize_trajectory(best_child)
+            tasks_with_res = [{"task_instruction": t, "task_res": o} for t, o in zip(thoughts, observations)]
+            rsp = await Conclusion().run(final_goal=best_child.question, tasks_res=tasks_with_res)
+            yield f"最终总结：{rsp}\n"
+        else:
+            yield "未找到有效解决方案。\n"
+
+    async def streaming_run(self, iterations=10, n_generate_sample=2) -> AsyncGenerator[dict, None]:
+        self.root = Node(None, self.goal, execute_code=ExecuteNbCode())
+        for i in range(iterations):
+            logger.info(f"Iteration {i + 1}...")
+            yield {"type": "iteration_start", "iteration": i + 1}
+
+            if i == 0:
+                await self.force_pda(self.root, self.goal)
+                set_node_score(self.root, 7)
+                yield {"type": "force_pda_done", "root": self.root}
+                continue
+
+            leaf_nodes = collect_leaf_nodes(self.root)
+            leaf_terminal_nodes = [leaf for leaf in leaf_nodes if leaf.is_terminal]
+            leaf_terminal_nodes.sort(key=lambda leaf: leaf.reward, reverse=True)
+            yield {
+                "type": "leaf_terminal_nodes",
+                "nodes": leaf_terminal_nodes,
+                "iteration": i + 1
+            }
+            if leaf_terminal_nodes and leaf_terminal_nodes[0].reward >= 7:
+                logger.info(f"Terminal node with high reward found at iteration {i + 1}")
+                yield {
+                    "type": "high_reward_node_found",
+                    "node": leaf_terminal_nodes[0],
+                    "iteration": i + 1
+                }
+                return  # 直接返回，不yield最终结果
+
+            max_retries = 5
+            retries = 0
+            node = self.select_node(self.root)
+            while node is None or (node.is_terminal and node.reward < 7):
+                logger.info(f"Need to backtrack or terminal node with reward 0 found at iteration {i + 1}, reselecting...")
+                node = self.select_node(self.root)
+                retries += 1
+                if retries >= max_retries:
+                    logger.warning("Max selection retries reached, aborting search.")
+                    best_child = max(collect_all_nodes(self.root), key=lambda x: x.reward, default=self.root)
+                    yield {  # yield 最终结果
+                        "type": "final_best_child",
+                        "best_child": best_child,
+                        "all_nodes": self.all_nodes
+                    }
+                    return
+            if node is None or node.value == 0:
+                logger.info("All paths lead to terminal nodes with a low reward. Ending search.")
+                best_child = max(collect_all_nodes(self.root), key=lambda x: x.reward, default=self.root)
+                yield {
+                    "type": "final_best_child",
+                    "best_child": best_child,
+                    "all_nodes": self.all_nodes
+                }
+                return  # 提前返回，不yield最终结果
+
+            if node.is_terminal and node.reward >= 7:
+                logger.info(f"Terminal node with high reward found at iteration {i + 1}")
+                yield {
+                    "type": "high_reward_node_found",
+                    "node": node,
+                    "iteration": i + 1
+                }
+                return
+
+            yield {
+                "type": "node_selected",
+                "node": node,
+                "iteration": i + 1
+            }
+
+            expand_gen = self.expand_node(node, self.goal, n_generate_sample=n_generate_sample)
+            async for expand_info in expand_gen:
+                if expand_info["type"] == "action_executed":
+                    yield {
+                        "type": "action_executed",
+                        "action": expand_info["info"]["action"],
+                        "observation": expand_info["info"]["observation"],
+                        "is_success": expand_info["info"]["is_success"],
+                        "iteration": i + 1
+                    }
+
+            children_info = [{"state": child.state, "reward": child.reward} for child in node.children]
+            yield {
+                "type": "node_expanded",
+                "parent": node,
+                "children": children_info,
+                "iteration": i + 1
+            }
+
+            retries = 0
+            while node.is_terminal or not node.children:
+                retries += 1
+                if retries >= max_retries:
+                    logger.warning("Max expansion retries reached, aborting search.")
+                    yield {  # 达到最大重试次数
+                        "type": "final_best_child",
+                        "best_child": node,
+                        "all_nodes": self.all_nodes
+                    }
+                    return
+
+                logger.info(f"Depth limit node found at iteration {i + 1}, reselecting...")
+                node = self.select_node(self.root)
+                yield {
+                    "type": "node_selected",
+                    "node": node,
+                    "iteration": i + 1
+                }
+                expand_gen = self.expand_node(node, self.goal, n_generate_sample=n_generate_sample)
+                async for expand_info in expand_gen:
+                    if expand_info["type"] == "action_executed":
+                        yield {
+                            "type": "action_executed",
+                            "action": expand_info["info"]["action"],
+                            "observation": expand_info["info"]["observation"],
+                            "is_success": expand_info["info"]["is_success"],
+                            "iteration": i + 1
+                        }
+                children_info = [{"state": child.state, "reward": child.reward} for child in node.children]
+
+                yield {
+                    "type": "node_expanded",
+                    "parent": node,
+                    "children": children_info,
+                    "iteration": i + 1
+                }
+
+            best_child = max(node.children, key=lambda child: child.value)
+            best_child_reward, terminal_node = await self.rollout(best_child,
+                                                                  n_generate_sample=n_generate_sample,
+                                                                  task=self.root.question, max_depth=10)
+            print(f" ---------------------------rollout ended --------------------------------\n")
+
+            yield {
+                "type": "rollout_result",
+                "best_child_reward": best_child_reward,
+                "terminal_node": terminal_node,
+                "iteration": i + 1
+            }
+
+            self.terminal_nodes.append(terminal_node)
+            if terminal_node.reward >= 7:
+                logger.info("SUCCESSFUL TRAJECTORY FOUND DURING SIMULATION")
+                yield {  # yield 最终结果
+                    "type": "final_best_child",
+                    "best_child": terminal_node,
+                    "all_nodes": []  # 可以在这里返回all_nodes，或者在最后返回
+                }
+                return
+
+            backpropagate(terminal_node, best_child_reward)
+            yield {
+                "type": "backpropagate",
+                "terminal_node": terminal_node,
+                "reward": best_child_reward,
+                "iteration": i + 1
+            }
+
+            all_nodes = [(node, node.value) for node in collect_all_nodes(self.root)]
+            self.all_nodes = [node for node, val in all_nodes]
+            terminal_nodes_with_high_reward = [node for node in collect_all_nodes(self.root) if
+                                               node.is_terminal and node.reward >= 7]
+
+            if terminal_nodes_with_high_reward:
+                logger.info(f"Terminal node with high reward found at iteration {i + 1}")
+                best_node = max(terminal_nodes_with_high_reward, key=lambda x: x.value)
+
+                yield {  # yield 最终结果
+                    "type": "final_best_child",
+                    "best_child": best_node,
+                    "all_nodes": self.all_nodes
+                }
+                return
+
+            reflection = await node.generate_action.reflect_failed_trajectory(terminal_node)
+            self.reflection_map[node.generate_unique_key()] = reflection
+            yield {
+                "type": "reflection_generated",
+                "reflection": reflection,
+                "iteration": i + 1
+            }
+
+            for j, (node, value) in enumerate(all_nodes):
+                logger.info(f"Node {1}: {str(node)}")
+            logger.info(f"State of all_nodes after iteration {i + 1}: {all_nodes}")
+
+        all_nodes_list = collect_all_nodes(self.root)
+        all_nodes_list.extend(self.terminal_nodes)
+        logger.info(f"State of all_nodes after all iterations: {all_nodes_list}")
+        best_child = max(all_nodes_list, key=lambda x: x.reward)
+        if best_child.reward >= 7:
+            logger.success("Successful trajectory found")
+        else:
+            logger.warning("No successful trajectory found")
+        if best_child is None:
+            best_child = self.root
+        yield {
+            "type": "final_best_child",
+            "best_child": best_child,
+            "all_nodes": all_nodes_list
+        }
+
+    async def force_pda(self, node, goal):
+        instruction, code = await node.generate_action.generate_pda(goal)
+        predefined_thought = {
+            "task_type": "pda",
+            "thought": instruction
+        }
+        obs, r, is_success, info = await ExecuteAction().step(goal, instruction, code, node.execute_code)
+        node.state['thought'] = predefined_thought
+        node.state['action'] = code
+        node.state['observation'] = obs
+        node.is_success = is_success
+
+    def select_node(self, node):
+        current_depth = 0
+        max_depth = 50
+
+        while node and node.children and current_depth < max_depth:
+            current_depth += 1
+            terminal_children = [child for child in node.children if child.is_terminal]
+
+            high_reward_terminal_node = next((c for c in terminal_children if c.reward >= 7), None)
+            if high_reward_terminal_node:
+                return high_reward_terminal_node
+
+            if len(terminal_children) == len(node.children):
+                if all(c.reward < 5 for c in terminal_children):
+                    if node.parent:
+                        logger.debug(f"Pruning node {node} from parent")
+                        node.parent.children.remove(node)
+                    node = node.parent
+                    continue
+                else:
+                    return max((c for c in terminal_children), key=lambda x: x.reward)
+
+            non_terminal_children = [c for c in node.children if not c.is_terminal]
+            if not non_terminal_children:
+                continue
+            node = max(non_terminal_children, key=lambda child: child.uct())
+
+        return node if node else self.root
+
+    async def expand_node(self, node, goal, n_generate_sample) -> AsyncGenerator[dict, None]:
+        if node.depth >= 10:
+            logger.info("Depth limit reached")
+            node.is_terminal = True
+            return
+        print("准备扩展新节点")
+        new_nodes, execution_infos = await self.generate_new_states(node, goal, n_generate_sample)
+        for info in execution_infos:
+            yield {"type": "action_executed", "info": info}
+
+        node.children.extend(new_nodes)
+        rewards = await evaluate_sub_node(node, goal, n_evaluate_sample=1)
+        node.children.sort(key=lambda c: c.reward, reverse=True)
+
+        print(f"expand_node方法中直接返回的奖励分数: {rewards}")
+        print(f"expand_node方法中当前节点所有子节点的分值列表: {[child.reward for child in node.children]}")
+        for child, reward in zip(node.children, rewards):
+            child.reward = reward
+        for child in node.children:
+            if child.is_terminal and child.reward < 5:
+                trajectory = collect_trajectory(child)
+                self.failed_trajectories.append({'trajectory': trajectory, 'final_answer': f"{child.state['thought']}"})
+
+    async def generate_new_states(self, node: Node, goal, n_generate_sample):
+        cur_trajectory = generate_prompt(node)
+        cur_short_trajectory = generate_short_prompt(node)
+        workflow_exps = []
+        if node.depth >= 2 and self.use_exp_driven_search:
+            logger.info(f"-------------- 准备检索工作流经验 ---------------")
+            cur_plan = trajectory2plan(node)
+            workflow_exps = self.solution_space_generate_engine.run(cur_plan)
+            logger.info(f"相关工作流经验数量: {len(workflow_exps)}, 当前工作流: {cur_plan}")
+
+        sampled_actions = await node.generate_action.generate_solution_space(cur_short_trajectory,
+                                                                             f"\nThought {node.depth + 1}: ",
+                                                                             n_generate_sample, workflow_exps,
+                                                                             reflection_map=self.reflection_map,
+                                                                             failed_trajectories=self.failed_trajectories)
+        logger.info(f"Sampled num: {len(sampled_actions)}, SAMPLED ACTIONS: {sampled_actions}")
+
+        tried_actions = []
+        unique_states = {}
+        execution_infos = []
+        layer_reflections = []
+        for i, item in enumerate(sampled_actions):
+            thought_dict = item["thought"]
+            action = item["response"]
+            new_state = node.state.copy()
+            new_exec = await node.execute_code.model_copy(deep=True)
+
+            print(f"type of thought_dict: {type(thought_dict)}, content: {thought_dict}")
+            original_thought = thought_dict if isinstance(thought_dict, dict) else json5.loads(thought_dict)
+            original_thought['task_type'] = original_thought.get('task_type', 'other')
+            original_thought['thought'] = original_thought.get('thought', '')
+            original_unique_key = f"{original_thought['task_type']}::{original_thought['thought']}"
+            if original_unique_key in unique_states:
+                continue
+
+            if original_thought['task_type'] == 'finish':
+                logger.success("Goal achieved")
+
+                def collect_all_result(cur_node: Node) -> str:
+                    msg_list = []
+                    while cur_node:
+                        cur_depth = cur_node.depth
+                        msg_list.append(f"observation {cur_depth}: {cur_node.state['observation']}\n")
+                        msg_list.append(f"action {cur_depth}: {cur_node.state['action']}\n")
+                        cur_node = cur_node.parent
+                    msg_list.reverse()
+                    all_observation = "".join(msg_list)
+                    return all_observation
+
+                new_state['thought'] = original_thought
+                new_state['action'] = ""
+                new_state['observation'] = "\n all actions and observations:" + collect_all_result(node)
+                new_node = Node(state=new_state, question=node.question, parent=node, execute_code=new_exec)
+                new_node.is_terminal = True
+                new_node.depth = node.depth + 1
+                unique_states[original_unique_key] = new_node
+                continue
+
+            action_code = CodeParser.parse_code(block=None, text=action, lang='python')
+            tried_actions.append(action_code)
+
+            if not action_code:
+                continue
+
+            current_thought, task_type = original_thought, original_thought['task_type']
+            current_action_code = action_code
+            current_obs, current_r, current_is_success, current_info = await ExecuteAction().step(goal,
+                                                                                                  current_thought,
+                                                                                                  current_action_code,
+                                                                                                  new_exec)
+            execution_info = {
+                "action": current_action_code,
+                "observation": current_obs,
+                "is_success": current_is_success
+            }
+            execution_infos.append(execution_info)
+
+            reflection_count = 0
+            reflection_attempt = [{"action": current_action_code, "observation": current_obs}]
+
+            while not current_is_success and reflection_count < self.max_reflections_per_node and node.is_success:
+                reflection_count += 1
+                logger.info(f"code execution error, start reflection in {reflection_count} counts.")
+                error_msg = current_obs if current_obs else "unknown error"
+                reflection_thought, current_action_code = await node.generate_action.debug_with_reflection(node,
+                                                                                                           current_thought,
+                                                                                                           current_action_code,
+                                                                                                           error_msg,
+                                                                                                           layer_reflections)
+                current_thought = {
+                    "thought": reflection_thought,
+                    "task_type": task_type
+                }
+                current_obs, current_r, current_is_success, current_info = await ExecuteAction().step(goal,
+                                                                                                      current_thought,
+                                                                                                      current_action_code,
+                                                                                                      new_exec)
+                execution_info = {
+                    "action": current_action_code,
+                    "observation": current_obs,
+                    "is_success": current_is_success
+                }
+                execution_infos.append(execution_info)
+                reflection_attempt.append({"action": current_action_code, "observation": current_obs})
+                if current_is_success:
+                    logger.info(f"reflection success in {reflection_count} rounds")
+                    break
+
+            if not current_is_success and reflection_count == self.max_reflections_per_node and node.is_success and i < len(
+                    sampled_actions) - 1:
+                layer_reflection = await node.generate_action.reflect_failed_node(reflection_attempt)
+                layer_reflections.append(layer_reflection)
+
+            if original_unique_key in unique_states:
+                await new_exec.terminate()
+                continue
+
+            new_state['thought'] = current_thought
+            new_state['action'] = current_action_code
+            new_state['observation'] = current_obs
+            new_node = Node(state=new_state, question=node.question, parent=node, execute_code=new_exec,
+                            is_success=current_is_success)
+            new_node.depth = node.depth + 1
+            new_node.is_terminal = (current_thought['task_type'] == 'finish')
+            unique_states[original_unique_key] = new_node
+
+            if new_node.is_terminal and new_node.reward < 5:
+                trajectory = collect_trajectory(new_node)
+                self.failed_trajectories.append({
+                    'trajectory': trajectory,
+                    'final_answer': f"{current_action_code}\n{current_obs}"
+                })
+
+        return list(unique_states.values()), execution_infos
+
+    async def rollout(self, node: Node, task, n_generate_sample, max_depth=8):
+        logger.info("ROLLING OUT")
+        depth = node.depth
+        rewards, tmp_node = [], node
+        while tmp_node:
+            rewards.append(tmp_node.reward)
+            tmp_node = tmp_node.parent
+
+        while not node.is_terminal and depth < max_depth and node.is_success:
+            logger.info(f"ROLLING OUT {depth}")
+            expand_gen = self.expand_node(node, self.goal, n_generate_sample=n_generate_sample)
+            async for expand_info in expand_gen:
+                if expand_info["type"] == "action_executed":
+                    logger.info(
+                        f"执行动作：{expand_info['info']['action']}，观察结果：{expand_info['info']['observation']}")  # 这里仅记录日志
+
+            for child in node.children:
+                if child.is_terminal and child.reward >= 7:
+                    for sibling in node.children:
+                        if sibling != child:
+                            backpropagate(sibling, (sum(rewards) + sibling.reward) / (len(rewards) + 1))
+                    rewards.append(child.reward)
+                    return sum(rewards) / len(rewards), child
+
+            rewards = [child.reward for child in node.children]
+            print(f"当前节点所有子节点的分值列表: {rewards}")
+            best_child = max(node.children, key=lambda children: children.reward)
+
+            for sibling in node.children:
+                if sibling != best_child:
+                    backpropagate(sibling, (sum(rewards) + sibling.reward) / (len(rewards) + 1))
+
+            rewards.append(best_child.reward)
+            node = best_child
+            depth += 1
+
+        if node.is_terminal:
+            rewards.append(node.reward)
+
+        if depth == max_depth:
+            logger.info(f"reaching max_depth, rollout ended")
+            rewards.append(0)
+
+        if not node.is_success:
+            logger.warning(f"node error, rollout ended")
+            rewards.append(0)
+
+        logger.info("ROLLOUT FINISHED")
+        return sum(rewards) / len(rewards), node
+
+    def calculate_total_cost(self) -> tuple[int, int]:
+        prompt_tokens, completion_tokens = 0, 0
+
+        def _traverse(node: Node):
+            nonlocal prompt_tokens, completion_tokens
+            if not node:
+                return
+
+            if node.generate_action:
+                prompt_token = node.generate_action.llm.cost_manager.total_prompt_tokens
+                completion_token = node.generate_action.llm.cost_manager.total_completion_tokens
+                prompt_tokens += prompt_token
+                completion_tokens += completion_token
+
+            for child in node.children:
+                _traverse(child)
+
+        if self.root:
+            _traverse(self.root)
+
+        return prompt_tokens, completion_tokens

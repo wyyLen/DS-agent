@@ -1,0 +1,38 @@
+import asyncio
+
+from examples.experiment.da_bench.util.DABENCH import DABench
+from metagpt.roles.ds_agent.ds_agent import DSAgent
+from metagpt.strategy.lats_react import LanguageAgentTreeSearch
+
+
+def question_prepare(id: int) -> str:
+    bench = DABench()
+    task = bench.generate_formatted_prompt(id)
+    return task
+
+
+if __name__ == "__main__":
+    task = question_prepare(593)   # 410, 593, 662
+    ds_agent = DSAgent(use_reflection=False, use_rag=False, use_kaggle_exp=False, use_exp_extractor=False)
+    lats = LanguageAgentTreeSearch(goal=task)
+    best_child, all_nodes = asyncio.run(lats.run(iterations=10))
+    print("-----------------------")
+    print(f"lats result: {best_child.state['thought']['thought']}")
+    ds_agent.add_node_trajectory_to_working_memory_and_planner(best_child)
+    print("-----------------------")
+    for msg in ds_agent.working_memory.get():
+        print(f"{msg.role}: {msg.content}")
+
+    print("-----------------------")
+    for task in ds_agent.planner.plan.tasks:
+        print(f"task_id: {task.task_id} and task_type: {task.task_type} dependent_task_ids: {task.dependent_task_ids} \n"
+              f"instruction: {task.instruction} \n"
+              f"code: {task.code} \n"
+              f"result: {task.result}")
+
+    prompt_token, completion_token = lats.calculate_total_cost()
+    print(f"Prompt tokens: {prompt_token}, Completion tokens: {completion_token},"
+          f"total_tokens: {prompt_token + completion_token}")
+
+
+

@@ -1,0 +1,75 @@
+import json
+import re
+
+from metagpt.const import DA_EVAL_RES_PATH
+
+
+def get_o1_accuracy() -> dict:
+    reformat_path = DA_EVAL_RES_PATH / "infiagent_o1_batch0_dabench_result_reformat4k-checked.json"
+    with open(reformat_path, "r", encoding="utf-8") as f:
+        reformat_data = f.read()
+    final_res = json.loads(reformat_data)["res"]["results"]
+    id2truth = {
+        item["id"]: all(value for value in item["correctness"].values())
+        for item in final_res
+    }
+    return id2truth
+
+
+def get_o1_times() -> dict:
+    original_res_path = DA_EVAL_RES_PATH / "infiagent_o1_batch0.json"
+    with open(original_res_path, "r", encoding="utf-8") as f:
+        original_data = f.read()
+    original_res = json.loads(original_data)
+    id2times = {
+        item["id"]: item["response"].count("```python")
+        for item in original_res
+    }
+    return id2times
+
+
+def combine_o1_results(o1_accuracy: dict, o1_times: dict) -> dict:
+    """
+    将 o1_accuracy 和 o1_times 整合为一个字典。
+    return:
+        dict: 整合后的字典，格式为 {id: {"accuracy": bool, "times": int}}。
+    """
+    combined_results = {}
+
+    # 遍历所有 id，确保两个字典中的 id 一致
+    for task_id in o1_accuracy.keys():
+        combined_results[task_id] = {
+            "accuracy": o1_accuracy.get(task_id, False),  # 如果 id 不存在于 o1_accuracy，默认 False
+            "times": o1_times.get(task_id, 0),  # 如果 id 不存在于 o1_times，默认 0
+        }
+
+    return combined_results
+
+
+def calculate_accuracy_by_times(o1_times_accuracy: dict) -> dict:
+    count_times_1, correct_times_1, count_times_gt_1, correct_times_gt_1 = 0, 0, 0, 0
+    for task_id, data in o1_times_accuracy.items():
+        times, accuracy = data["times"], data["accuracy"]
+        if times == 1:
+            count_times_1 += 1
+            if accuracy:
+                correct_times_1 += 1
+        elif times > 1:
+            count_times_gt_1 += 1
+            if accuracy:
+                correct_times_gt_1 += 1
+    accuracy_when_times_1 = correct_times_1 / count_times_1 if count_times_1 > 0 else 0
+    accuracy_when_times_gt_1 = correct_times_gt_1 / count_times_gt_1 if count_times_gt_1 > 0 else 0
+    return {
+        "count_times_1": count_times_1,
+        "accuracy_when_times_1": accuracy_when_times_1,
+        "count_times_gt_1": count_times_gt_1,
+        "accuracy_when_times_gt_1": accuracy_when_times_gt_1,
+    }
+
+
+if __name__ == '__main__':
+    o1_times_accuracy = combine_o1_results(get_o1_accuracy(), get_o1_times())
+    accuracy_results = calculate_accuracy_by_times(o1_times_accuracy)
+    print(accuracy_results)
+
