@@ -18,15 +18,47 @@ from dsagent_core.retrieval.base import (
 from dsagent_core.retrieval.text_retriever import TextExperienceRetriever
 from dsagent_core.retrieval.workflow_retriever import WorkflowExperienceRetriever
 from dsagent_core.search.tree_search import TreeSearchEngine, SearchNode
+from dsagent_core.search.lats_core import LATSCore, LATSNode
 
-__version__ = "0.1.0"
+try:
+    from dsagent_core.adapters import (
+        AutoGenAdapter,
+        AUTOGEN_AVAILABLE,
+        MetaGPTLATSAdapter,
+        METAGPT_LATS_AVAILABLE,
+        AutoGenLATSAdapter,
+        AUTOGEN_LATS_AVAILABLE,
+        create_autogen_lats,
+    )
+except ImportError:
+    AutoGenAdapter = None
+    AUTOGEN_AVAILABLE = False
+    MetaGPTLATSAdapter = None
+    METAGPT_LATS_AVAILABLE = False
+    AutoGenLATSAdapter = None
+    AUTOGEN_LATS_AVAILABLE = False
+    create_autogen_lats = None
+
+__version__ = "0.2.0"
 
 __all__ = [
+    # Retrieval
     "ExperienceRetriever",
     "RetrievalResult",
     "ExperienceEntry",
     "TextExperienceRetriever",
     "WorkflowExperienceRetriever",
+    # Search
     "TreeSearchEngine",
     "SearchNode",
+    "LATSCore",
+    "LATSNode",
+    # Adapters (optional)
+    "AutoGenAdapter",
+    "AUTOGEN_AVAILABLE",
+    "MetaGPTLATSAdapter",
+    "METAGPT_LATS_AVAILABLE",
+    "AutoGenLATSAdapter",
+    "AUTOGEN_LATS_AVAILABLE",
+    "create_autogen_lats",
 ]

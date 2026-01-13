@@ -132,10 +132,17 @@ class DSAgent:
 
 class LATSAgent:
     def __init__(self, agent_id: str, use_exp_driven_search=True):
-        _import_metagpt()  # Lazy load MetaGPT
         self.agent_id = agent_id
-        # 启用经验驱动搜索
-        self.agent = LanguageAgentTreeSearchStream(use_exp_driven_search=True)
+        
+        # Use new dsagent_core LATS implementation
+        from dsagent_core.adapters import MetaGPTLATSAdapter
+        
+        logger.info(f"🌲 Initializing LATS agent {agent_id} with dsagent_core")
+        self.agent = MetaGPTLATSAdapter(
+            use_exp_driven_search=use_exp_driven_search,
+            max_depth=10,
+            high_reward_threshold=7.0
+        )
         self._active = False
         self._lock = asyncio.Lock()
         self.event_counter = 0
@@ -156,20 +163,24 @@ class LATSAgent:
 
     async def process_stream(self, requirement: str, iterations=10, n_generate_sample=2) -> AsyncGenerator[dict, None]:
         try:
+            logger.info(f"🌲 LATS Agent {self.agent_id} starting tree search for: {requirement[:50]}...")
             self.agent.goal = requirement
-            async for chunk in self.agent.enhance_run(iterations=iterations, n_generate_sample=n_generate_sample):
-                self.event_counter += 1
-                yield {
-                    "type": "text_chunk",
-                    "content": chunk,  # 这里直接使用enhance_run返回的字符串
-                    "timestamp": datetime.now().isoformat(),
-                    "sequence": self.event_counter
-                }
-                # Use logger instead of print to avoid encoding issues
-                logger.debug(f"Chunk {self.event_counter}: {chunk[:100] if len(chunk) > 100 else chunk}")
+            
+            # Use new enhance_run from dsagent_core adapter
+            conclusion = await self.agent.enhance_run(iterations=iterations, n_generate_sample=n_generate_sample)
+            
+            # Stream the conclusion
+            self.event_counter += 1
+            yield {
+                "type": "text_chunk",
+                "content": conclusion,
+                "timestamp": datetime.now().isoformat(),
+                "sequence": self.event_counter
+            }
+            
             yield {
                 "type": "system",
-                "content": "处理流程已完成",
+                "content": "LATS 树搜索已完成",
                 "status": "completed",
                 "timestamp": datetime.now().isoformat()
             }
@@ -195,10 +206,14 @@ class AgentServiceProvider:
             "lats": {}
         }
         
-        # Log framework selection
+        # Log framework selection with both print and logger
+        print("=" * 60)
+        print(f"🚀 Agent Framework: {self.framework.upper()}")
+        print("=" * 60)
         logger.info(f"=" * 60)
         logger.info(f"Agent Framework: {self.framework.upper()}")
         if self.framework == 'autogen' and not AUTOGEN_ENABLED:
+            print("⚠️  AutoGen requested but not available, falling back to MetaGPT")
             logger.warning("AutoGen requested but not available, falling back to MetaGPT")
             self.framework = 'metagpt'
         logger.info(f"=" * 60)
@@ -207,17 +222,13 @@ class AgentServiceProvider:
 
     def _init_agent_pool(self, initial_agent_counts: dict):
         for mode, count in initial_agent_counts.items():
-            # Skip LATS when using AutoGen (not yet implemented)
-            if mode == "lats" and self.framework == 'autogen' and AUTOGEN_ENABLED:
-                logger.info("Skipping LATS agent initialization for AutoGen (not implemented)")
-                continue
-            
             for _ in range(count):
                 agent_id = f"{mode.upper()}-{len(self.agents_pool[mode]) + 1}-{int(time.time())}"
                 
                 if self.framework == 'autogen' and AUTOGEN_ENABLED:
                     # Use AutoGen agents
                     if mode == "ds":
+                        print(f"🤖 Creating AutoGen DS agent {agent_id}...")
                         text_exp_path = Path("examples/data/exp_bank/plan_exp.json")
                         workflow_exp_path = Path("examples/data/exp_bank/workflow_exp2_clean_new.json")
                         self.agents_pool[mode][agent_id] = AutoGenDSAgent(
@@ -225,15 +236,120 @@ class AgentServiceProvider:
                             text_exp_path=text_exp_path if text_exp_path.exists() else None,
                             workflow_exp_path=workflow_exp_path if workflow_exp_path.exists() else None
                         )
-                    # LATS not implemented for AutoGen
-                    logger.info(f"Initialized AutoGen {mode} agent {agent_id}")
+                        print(f"✅ Initialized AutoGen DS agent {agent_id}")
+                        logger.info(f"✅ Initialized AutoGen {mode} agent {agent_id}")
+                    elif mode == "lats":
+                        # ✨ NEW: AutoGen now supports LATS via dsagent_core!
+                        from dsagent_core.adapters import create_autogen_lats
+                        import os
+                        
+                        api_key = os.getenv('DASHSCOPE_API_KEY')
+                        if not api_key:
+                            print("⚠️  DASHSCOPE_API_KEY not set, cannot create AutoGen LATS agent")
+                            logger.warning("⚠️  DASHSCOPE_API_KEY not set, cannot create AutoGen LATS agent")
+                            continue
+                        
+                        print(f"🌲 Creating AutoGen LATS agent {agent_id} with dsagent_core...")
+                        logger.info(f"🌲 Creating AutoGen LATS agent {agent_id} with dsagent_core")
+                        # Create a wrapper class for AutoGen LATS
+                        class AutoGenLATSAgentWrapper:
+                            def __init__(self, agent_id, lats_adapter):
+                                self.agent_id = agent_id
+                                self.lats_adapter = lats_adapter
+                                self._active = False
+                                self._lock = asyncio.Lock()
+                                self.event_counter = 0
+                            
+                            async def acquire(self):
+                                async with self._lock:
+                                    if not self._active:
+                                        self._active = True
+                                        return True
+                                    return False
+                            
+                            def release(self):
+                                self._active = False
+                            
+                            async def process_stream(self, requirement: str, iterations=10, n_generate_sample=2):
+                                try:
+                                    print(f"🌲 AutoGen LATS Agent {self.agent_id} starting tree search")
+                                    logger.info(f"🌲 AutoGen LATS Agent {self.agent_id} starting tree search")
+                                    
+                                    # Add timeout protection
+                                    import asyncio
+                                    result = await asyncio.wait_for(
+                                        self.lats_adapter.run_and_format(
+                                            goal=requirement,
+                                            iterations=iterations,
+                                            n_generate_sample=n_generate_sample
+                                        ),
+                                        timeout=300.0  # 5 minute timeout
+                                    )
+                                    
+                                    # Format result
+                                    output = f"LATS 树搜索结果:\n"
+                                    output += f"探索节点数: {result['nodes_explored']}\n"
+                                    output += f"最佳奖励: {result['best_reward']:.2f}/10\n"
+                                    output += f"解决方案深度: {result['depth']}\n\n"
+                                    output += f"解决方案步骤:\n"
+                                    for i, step in enumerate(result['solution_steps'], 1):
+                                        thought = step.get('thought', {})
+                                        if isinstance(thought, dict):
+                                            thought_text = thought.get('thought', str(thought))
+                                        else:
+                                            thought_text = str(thought)
+                                        output += f"{i}. {thought_text[:200]}\n"
+                                    output += f"\n最终输出:\n{result['final_output'][:1000]}"
+                                    
+                                    self.event_counter += 1
+                                    yield {
+                                        "type": "text_chunk",
+                                        "content": output,
+                                        "timestamp": datetime.now().isoformat(),
+                                        "sequence": self.event_counter
+                                    }
+                                    
+                                    yield {
+                                        "type": "system",
+                                        "content": "AutoGen LATS 树搜索已完成",
+                                        "status": "completed",
+                                        "timestamp": datetime.now().isoformat()
+                                    }
+                                except asyncio.TimeoutError:
+                                    error_msg = "LATS 搜索超时 (5分钟)"
+                                    print(f"⚠️  {error_msg}")
+                                    logger.error(f"AutoGen LATS Agent {self.agent_id} timeout")
+                                    yield {
+                                        "type": "error",
+                                        "code": 504,
+                                        "content": error_msg,
+                                        "timestamp": datetime.now().isoformat()
+                                    }
+                                except Exception as e:
+                                    logger.error(f"AutoGen LATS Agent {self.agent_id} 处理异常: {str(e)}")
+                                    yield {
+                                        "type": "error",
+                                        "code": 500,
+                                        "content": str(e),
+                                        "timestamp": datetime.now().isoformat()
+                                    }
+                                finally:
+                                    self.release()
+                        
+                        lats_adapter = create_autogen_lats(api_key=api_key, model="qwen-plus")
+                        self.agents_pool[mode][agent_id] = AutoGenLATSAgentWrapper(agent_id, lats_adapter)
+                        print(f"✅ Initialized AutoGen LATS agent {agent_id}")
+                        logger.info(f"✅ Initialized AutoGen LATS agent {agent_id}")
                 else:
                     # Use MetaGPT agents (default)
                     if mode == "ds":
                         self.agents_pool[mode][agent_id] = DSAgent(agent_id)
+                        print(f"✅ Initialized MetaGPT DS agent {agent_id}")
                     elif mode == "lats":
+                        print(f"🌲 Creating MetaGPT LATS agent {agent_id}...")
                         self.agents_pool[mode][agent_id] = LATSAgent(agent_id)
-                    logger.info(f"Initialized MetaGPT {mode} agent {agent_id}")
+                        print(f"✅ Initialized MetaGPT LATS agent {agent_id}")
+                    logger.info(f"✅ Initialized MetaGPT {mode} agent {agent_id}")
 
     async def get_idle_agent(self, mode: str = "ds") -> Union[DSAgent, LATSAgent]:
         if mode not in self.agents_pool:
